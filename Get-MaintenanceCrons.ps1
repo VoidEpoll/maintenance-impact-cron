@@ -1,32 +1,40 @@
 <#
 .SYNOPSIS
     Lists the cron jobs that fire during a maintenance window, in run order,
-    with the comment/name lines that sit above each cron.
+    with the comment/name lines that sit above each cron. Handles many
+    crontab files (one per server/user) in a single run.
 
 .DESCRIPTION
+    - Files are expected to be named <hostname>-<username>.txt
+      (e.g. lbat017-webid.txt, lbat017-root.txt); host and user are taken
+      from the file name and shown in the report and the CSV.
     - Active crons that run in the window are listed in time order.
     - Commented-out crons (e.g. "#30 2 * * * /opt/job.sh") that would have run
       in the window are listed in the same order, marked as COMMENTED.
     - All other commented-out crons are listed at the end for reference.
     - Comment lines directly above a cron (no blank line in between) are
       treated as its name/tag.
-    Output is printed, saved to a text file and copied to the clipboard.
+    Output is printed, saved to one text file and copied to the clipboard.
+    -Csv also writes one combined CSV (Excel) for all files with Host/User columns.
 
 .EXAMPLE
-    .\Get-MaintenanceCrons.ps1 -CronFile .\crontab.txt
+    .\Get-MaintenanceCrons.ps1 -CronFile .\crons\ -Audit -Csv
 
 .EXAMPLE
-    .\Get-MaintenanceCrons.ps1 -CronFile .\crontab.txt -Start "2026-11-14 00:30" -End "2026-11-14 12:30"
+    .\Get-MaintenanceCrons.ps1 -CronFile .\lbat017-webid.txt, .\lbat017-root.txt
+
+.EXAMPLE
+    .\Get-MaintenanceCrons.ps1 -CronFile .\crons\*.txt -Start "2026-11-14 00:30" -End "2026-11-14 12:30"
 #>
 param(
-    [Parameter(Mandatory = $true)][string]$CronFile,
+    [Parameter(Mandatory = $true)][string[]]$CronFile,   # files, folders or wildcards
     [datetime]$Start = '2026-11-14 00:30',
     [datetime]$End   = '2026-11-14 12:30',
     [string]$OutFile,
     [switch]$NoClipboard,
     [switch]$Audit,
     [switch]$ScreenOnly,  # print only: no .txt, no .csv, no clipboard
-    [switch]$Csv          # with -Audit, also export all crons to .audit.csv
+    [switch]$Csv          # also export all crons of all files to one .csv for Excel
 )
 
 $ErrorActionPreference = 'Stop'
@@ -138,162 +146,79 @@ function Format-RunTimes {
     return "$($times[0..2] -join ', ') ... $($times[-1])  ($($times.Count) runs)"
 }
 
-# ---------------------------------------------------------------- parse file
-if (-not (Test-Path -LiteralPath $CronFile)) { throw "Cron file not found: $CronFile" }
-if ($End -lt $Start) { throw "End time is before start time." }
 
-$lines   = @(Get-Content -LiteralPath $CronFile)
-$entries = New-Object 'System.Collections.Generic.List[object]'
-$pending = @()
-$lineTypes = @{}   # line number -> classification, used by -Audit
+# Splits "lbat017-webid" into host/user on the last '-' (hostnames may contain '-')
+function Get-HostUser {
+    param([string]$Path)
+    $base = [IO.Path]::GetFileNameWithoutExtension($Path)
+    if ($base -match '^(.+)-([^-]+)$') { return @($Matches[1], $Matches[2]) }
+    return @($base, '')
+}
 
-for ($i = 0; $i -lt $lines.Count; $i++) {
-    $trim = $lines[$i].Trim()
-    if ($trim -eq '') { $pending = @(); $lineTypes[$i + 1] = 'BLANK'; continue }
+# Parses one crontab file; returns its report lines, CSV rows and counts
+function Invoke-CronFile {
+    param([string]$Path)
 
-    $isComment = $trim.StartsWith('#')
-    $body = $trim
-    if ($isComment) { $body = $trim.TrimStart('#').Trim() }
-
-    $parsed = ConvertFrom-CronLine $body
-    if (-not $parsed) {
-        # Plain comment = name/tag for the next cron; env lines (SHELL=, MAILTO=) are skipped
-        if ($isComment -and $body -ne '') { $pending += $trim }
-        # Starts like a cron but could not be parsed - needs a manual look.
-        # For comments, require two schedule-like fields so tags such as "###### 2 AM jobs" aren't flagged.
-        $looksLikeCron = $body -match '^[\d\*@]' -and $body -notmatch '^\w+\s*='
-        if ($isComment) { $looksLikeCron = $body -match '^(@\w+|[\d\*][\d\*/,\-]*\s+[\d\*][\d\*/,\-]*)\s' }
-        if ($looksLikeCron) {
-            if ($isComment) { $lineTypes[$i + 1] = 'UNPARSED-COMMENTED' } else { $lineTypes[$i + 1] = 'UNPARSED' }
-        } elseif ($isComment)       { $lineTypes[$i + 1] = 'COMMENT/TAG' }
-        elseif ($body -match '^\w+\s*=') { $lineTypes[$i + 1] = 'ENV' }
-        else                        { $lineTypes[$i + 1] = 'UNPARSED' }
-        continue
-    }
-    if ($isComment) { $lineTypes[$i + 1] = 'CRON-COMMENTED' } else { $lineTypes[$i + 1] = 'CRON-ACTIVE' }
-
-    $parsed | Add-Member -NotePropertyMembers @{
-        LineNo    = $i + 1
-        Commented = $isComment
-        Raw       = $trim
-        Tags      = $pending
-    }
+    $hostName, $userName = Get-HostUser $Path
+    $lines   = @(Get-Content -LiteralPath $Path)
+    $entries = New-Object 'System.Collections.Generic.List[object]'
     $pending = @()
-    $entries.Add($parsed)
-}
+    $lineTypes = @{}   # line number -> classification, used by the audit
 
-# ---------------------------------------------------------------- evaluate
-$fmt = 'HH:mm'
-if ($Start.Date -ne $End.Date) { $fmt = 'dd-MMM HH:mm' }
+    for ($i = 0; $i -lt $lines.Count; $i++) {
+        $trim = $lines[$i].Trim()
+        if ($trim -eq '') { $pending = @(); $lineTypes[$i + 1] = 'BLANK'; continue }
 
-$inWindow = @()
-$commentedOutside = @()
-$reboot = @()
+        $isComment = $trim.StartsWith('#')
+        $body = $trim
+        if ($isComment) { $body = $trim.TrimStart('#').Trim() }
 
-foreach ($e in $entries) {
-    if ($e.Reboot) { $reboot += $e; continue }
-    $runs = Get-CronRunTimes $e $Start $End
-    if ($runs.Count -gt 0) {
-        $e | Add-Member -NotePropertyMembers @{ Runs = $runs; FirstRun = $runs[0] }
-        $inWindow += $e
-    } elseif ($e.Commented) {
-        $commentedOutside += $e
-    }
-}
-$inWindow = @($inWindow | Sort-Object FirstRun, LineNo)
+        $parsed = ConvertFrom-CronLine $body
+        if (-not $parsed) {
+            # Plain comment = name/tag for the next cron; env lines (SHELL=, MAILTO=) are skipped
+            if ($isComment -and $body -ne '') { $pending += $trim }
+            # Starts like a cron but could not be parsed - needs a manual look.
+            # For comments, require two schedule-like fields so tags such as "###### 2 AM jobs" aren't flagged.
+            $looksLikeCron = $body -match '^[\d\*@]' -and $body -notmatch '^\w+\s*='
+            if ($isComment) { $looksLikeCron = $body -match '^(@\w+|[\d\*][\d\*/,\-]*\s+[\d\*][\d\*/,\-]*)\s' }
+            if ($looksLikeCron) {
+                if ($isComment) { $lineTypes[$i + 1] = 'UNPARSED-COMMENTED' } else { $lineTypes[$i + 1] = 'UNPARSED' }
+            } elseif ($isComment)            { $lineTypes[$i + 1] = 'COMMENT/TAG' }
+            elseif ($body -match '^\w+\s*=') { $lineTypes[$i + 1] = 'ENV' }
+            else                             { $lineTypes[$i + 1] = 'UNPARSED' }
+            continue
+        }
+        if ($isComment) { $lineTypes[$i + 1] = 'CRON-COMMENTED' } else { $lineTypes[$i + 1] = 'CRON-ACTIVE' }
 
-# ---------------------------------------------------------------- output
-$activeCount    = @($inWindow | Where-Object { -not $_.Commented }).Count
-$commentedCount = @($inWindow | Where-Object { $_.Commented }).Count
-$sep = '-' * 70
-
-$out = New-Object 'System.Collections.Generic.List[string]'
-$out.Add("MAINTENANCE WINDOW : $($Start.ToString('ddd dd-MMM-yyyy HH:mm'))  ->  $($End.ToString('ddd dd-MMM-yyyy HH:mm'))")
-$out.Add("CRON FILE          : $((Resolve-Path -LiteralPath $CronFile).Path)")
-$out.Add("CRONS IN WINDOW    : $activeCount active, $commentedCount commented (will not run)")
-$out.Add($sep)
-
-if ($inWindow.Count -eq 0) {
-    $out.Add('No crons scheduled during the maintenance window.')
-}
-
-$n = 0
-foreach ($e in $inWindow) {
-    $n++
-    $status = 'ACTIVE'
-    if ($e.Commented) { $status = 'COMMENTED - will NOT run' }
-    $out.Add("$n) $($e.FirstRun.ToString($fmt))  [$status]  (line $($e.LineNo))")
-    foreach ($tag in $e.Tags) { $out.Add("   $tag") }
-    $out.Add("   $($e.Raw)")
-    $out.Add("   Runs: $(Format-RunTimes $e.Runs $fmt)")
-    $out.Add('')
-}
-
-if ($commentedOutside.Count -gt 0) {
-    $out.Add($sep)
-    $out.Add('OTHER COMMENTED CRONS (outside window - for reference only)')
-    $out.Add($sep)
-    foreach ($e in $commentedOutside) {
-        $out.Add("- (line $($e.LineNo)) COMMENTED")
-        foreach ($tag in $e.Tags) { $out.Add("   $tag") }
-        $out.Add("   $($e.Raw)")
-        $out.Add('')
-    }
-}
-
-if ($reboot.Count -gt 0) {
-    $out.Add($sep)
-    $out.Add('@REBOOT CRONS (run if the server is restarted during maintenance)')
-    $out.Add($sep)
-    foreach ($e in $reboot) {
-        $state = 'ACTIVE'
-        if ($e.Commented) { $state = 'COMMENTED' }
-        $out.Add("- (line $($e.LineNo)) $state")
-        foreach ($tag in $e.Tags) { $out.Add("   $tag") }
-        $out.Add("   $($e.Raw)")
-        $out.Add('')
-    }
-}
-
-# ---------------------------------------------------------------- audit
-if ($Audit) {
-    $total   = $lines.Count
-    $byType  = $lineTypes.Values | Group-Object | Sort-Object Name
-    $sum     = ($byType | Measure-Object Count -Sum).Sum
-    # Independent rough count: any non-comment line starting like a cron schedule
-    $rawActive    = @($lines | Where-Object { $_ -match '^\s*[\d\*@]' }).Count
-    $activeParsed = @($entries | Where-Object { -not $_.Commented }).Count
-
-    $out.Add('')
-    $out.Add('==================== AUDIT ====================')
-    $out.Add(("Total lines in file        : {0}" -f $total))
-    foreach ($g in $byType) { $out.Add(("  {0,-24} : {1}" -f $g.Name, $g.Count)) }
-    if ($sum -eq $total) {
-        $out.Add('Line reconciliation        : OK (every line classified)')
-    } else {
-        $out.Add("Line reconciliation        : MISMATCH ($sum classified vs $total lines)")
-    }
-    $out.Add(("Raw lines that look active : {0}" -f $rawActive))
-    $out.Add(("Active crons parsed        : {0}" -f $activeParsed))
-    if ($rawActive -eq $activeParsed) {
-        $out.Add('Active cron cross-check    : OK')
-    } else {
-        $out.Add('Active cron cross-check    : MISMATCH - check UNPARSED lines below')
+        $parsed | Add-Member -NotePropertyMembers @{
+            LineNo    = $i + 1
+            Commented = $isComment
+            Raw       = $trim
+            Tags      = $pending
+        }
+        $pending = @()
+        $entries.Add($parsed)
     }
 
-    $bad = @($lineTypes.GetEnumerator() | Where-Object { $_.Value -like 'UNPARSED*' } | Sort-Object Name)
-    $out.Add('')
-    if ($bad.Count -gt 0) {
-        $out.Add('Lines NOT understood (check manually):')
-        foreach ($b in $bad) { $out.Add(("  line {0,4} [{1}] {2}" -f $b.Name, $b.Value, $lines[$b.Name - 1].Trim())) }
-    } else {
-        $out.Add('Lines NOT understood       : none')
-    }
+    # ------------------------------------------------------------ evaluate
+    $inWindow = @()
+    $commentedOutside = @()
+    $reboot = @()
+    $rows = @()
 
-    # Every cron with its result, for spot-checking
-    $rows = foreach ($e in $entries) {
+    foreach ($e in $entries) {
         $runs = $null
-        if (-not $e.Reboot) { $runs = Get-CronRunTimes $e $Start $End }
+        if ($e.Reboot) { $reboot += $e }
+        else {
+            $runs = Get-CronRunTimes $e $Start $End
+            if ($runs.Count -gt 0) {
+                $e | Add-Member -NotePropertyMembers @{ Runs = $runs; FirstRun = $runs[0] }
+                $inWindow += $e
+            } elseif ($e.Commented) {
+                $commentedOutside += $e
+            }
+        }
+
         $count = 0
         if ($runs) { $count = $runs.Count }
         $status = 'ACTIVE'
@@ -305,7 +230,9 @@ if ($Audit) {
         }
         $inWin = 'NO'
         if ($e.Reboot) { $inWin = 'REBOOT' } elseif ($count -gt 0) { $inWin = 'YES' }
-        [pscustomobject]@{
+        $rows += [pscustomobject]@{
+            Host     = $hostName
+            User     = $userName
             LineNo   = $e.LineNo
             Status   = $status
             InWindow = $inWin
@@ -314,16 +241,167 @@ if ($Audit) {
             Runs     = $all
             Name     = ($e.Tags -join ' | ')
             Cron     = $e.Raw
+            File     = [IO.Path]::GetFileName($Path)
         }
     }
-    $out.Add('')
-    $out.Add("ALL $($entries.Count) CRONS:")
-    # Wide fixed width so long commands are not cut off in the file
-    $table = $rows | Format-Table LineNo, Status, InWindow, FirstRun, RunCount, Name, Cron -AutoSize | Out-String -Width 4096
-    foreach ($l in ($table.Trim("`r", "`n") -split "`r?`n")) { $out.Add($l.TrimEnd()) }
+    $inWindow = @($inWindow | Sort-Object FirstRun, LineNo)
+
+    # ------------------------------------------------------------ audit numbers
+    $total        = $lines.Count
+    $byType       = $lineTypes.Values | Group-Object | Sort-Object Name
+    $sum          = ($byType | Measure-Object Count -Sum).Sum
+    if (-not $sum) { $sum = 0 }
+    # Independent rough count: any non-comment line starting like a cron schedule
+    $rawActive    = @($lines | Where-Object { $_ -match '^\s*[\d\*@]' }).Count
+    $activeParsed = @($entries | Where-Object { -not $_.Commented }).Count
+    $bad          = @($lineTypes.GetEnumerator() | Where-Object { $_.Value -like 'UNPARSED*' } | Sort-Object Name)
+    $auditOk      = ($sum -eq $total) -and ($rawActive -eq $activeParsed) -and ($bad.Count -eq 0)
+
+    # ------------------------------------------------------------ report
+    $activeCount    = @($inWindow | Where-Object { -not $_.Commented }).Count
+    $commentedCount = @($inWindow | Where-Object { $_.Commented }).Count
+    $sep = '-' * 70
+
+    $out = New-Object 'System.Collections.Generic.List[string]'
+    $out.Add('=' * 70)
+    $out.Add("HOST: $hostName    USER: $userName")
+    $out.Add("FILE: $((Resolve-Path -LiteralPath $Path).Path)")
+    $out.Add('=' * 70)
+    $out.Add("CRONS IN WINDOW    : $activeCount active, $commentedCount commented (will not run)")
+    $out.Add($sep)
+
+    if ($inWindow.Count -eq 0) {
+        $out.Add('No crons scheduled during the maintenance window.')
+        $out.Add('')
+    }
+
+    $n = 0
+    foreach ($e in $inWindow) {
+        $n++
+        $status = 'ACTIVE'
+        if ($e.Commented) { $status = 'COMMENTED - will NOT run' }
+        $out.Add("$n) $($e.FirstRun.ToString($fmt))  [$status]  (line $($e.LineNo))")
+        foreach ($tag in $e.Tags) { $out.Add("   $tag") }
+        $out.Add("   $($e.Raw)")
+        $out.Add("   Runs: $(Format-RunTimes $e.Runs $fmt)")
+        $out.Add('')
+    }
+
+    if ($commentedOutside.Count -gt 0) {
+        $out.Add($sep)
+        $out.Add('OTHER COMMENTED CRONS (outside window - for reference only)')
+        $out.Add($sep)
+        foreach ($e in $commentedOutside) {
+            $out.Add("- (line $($e.LineNo)) COMMENTED")
+            foreach ($tag in $e.Tags) { $out.Add("   $tag") }
+            $out.Add("   $($e.Raw)")
+            $out.Add('')
+        }
+    }
+
+    if ($reboot.Count -gt 0) {
+        $out.Add($sep)
+        $out.Add('@REBOOT CRONS (run if the server is restarted during maintenance)')
+        $out.Add($sep)
+        foreach ($e in $reboot) {
+            $state = 'ACTIVE'
+            if ($e.Commented) { $state = 'COMMENTED' }
+            $out.Add("- (line $($e.LineNo)) $state")
+            foreach ($tag in $e.Tags) { $out.Add("   $tag") }
+            $out.Add("   $($e.Raw)")
+            $out.Add('')
+        }
+    }
+
+    if ($Audit) {
+        $out.Add("------------------ AUDIT ($hostName / $userName) ------------------")
+        $out.Add(("Total lines in file        : {0}" -f $total))
+        foreach ($g in $byType) { $out.Add(("  {0,-24} : {1}" -f $g.Name, $g.Count)) }
+        if ($sum -eq $total) {
+            $out.Add('Line reconciliation        : OK (every line classified)')
+        } else {
+            $out.Add("Line reconciliation        : MISMATCH ($sum classified vs $total lines)")
+        }
+        $out.Add(("Raw lines that look active : {0}" -f $rawActive))
+        $out.Add(("Active crons parsed        : {0}" -f $activeParsed))
+        if ($rawActive -eq $activeParsed) {
+            $out.Add('Active cron cross-check    : OK')
+        } else {
+            $out.Add('Active cron cross-check    : MISMATCH - check UNPARSED lines below')
+        }
+        $out.Add('')
+        if ($bad.Count -gt 0) {
+            $out.Add('Lines NOT understood (check manually):')
+            foreach ($b in $bad) { $out.Add(("  line {0,4} [{1}] {2}" -f $b.Name, $b.Value, $lines[$b.Name - 1].Trim())) }
+        } else {
+            $out.Add('Lines NOT understood       : none')
+        }
+        $out.Add('')
+        $out.Add("ALL $($entries.Count) CRONS:")
+        if ($rows.Count -gt 0) {
+            # Wide fixed width so long commands are not cut off in the file
+            $table = $rows | Format-Table LineNo, Status, InWindow, FirstRun, RunCount, Name, Cron -AutoSize | Out-String -Width 4096
+            foreach ($l in ($table.Trim("`r", "`n") -split "`r?`n")) { $out.Add($l.TrimEnd()) }
+        }
+        $out.Add('')
+    }
+
+    return [pscustomobject]@{
+        Host      = $hostName
+        User      = $userName
+        Out       = $out
+        Rows      = $rows
+        Active    = $activeCount
+        Commented = $commentedCount
+        Crons     = $entries.Count
+        AuditOk   = $auditOk
+    }
 }
 
-# ---------------------------------------------------------------- print + save
+# ---------------------------------------------------------------- collect files
+if ($End -lt $Start) { throw "End time is before start time." }
+
+$files = @()
+foreach ($item in $CronFile) {
+    if (Test-Path -LiteralPath $item -PathType Container) {
+        $files += Get-ChildItem -LiteralPath $item -Filter *.txt -File
+    } else {
+        $found = @(Get-ChildItem -Path $item -File -ErrorAction SilentlyContinue)
+        if ($found.Count -eq 0) { throw "Cron file not found: $item" }
+        $files += $found
+    }
+}
+# Skip this script's own reports if they sit in the same folder
+$files = @($files | Where-Object { $_.Name -notlike 'maintenance_crons_*' } | Sort-Object FullName -Unique)
+if ($files.Count -eq 0) { throw "No cron files found in: $($CronFile -join ', ')" }
+
+$fmt = 'HH:mm'
+if ($Start.Date -ne $End.Date) { $fmt = 'dd-MMM HH:mm' }
+
+$results = @(foreach ($f in $files) { Invoke-CronFile $f.FullName })
+
+# ---------------------------------------------------------------- summary + print + save
+$out = New-Object 'System.Collections.Generic.List[string]'
+$out.Add("MAINTENANCE WINDOW : $($Start.ToString('ddd dd-MMM-yyyy HH:mm'))  ->  $($End.ToString('ddd dd-MMM-yyyy HH:mm'))")
+$out.Add("FILES PROCESSED    : $($results.Count)")
+$out.Add('')
+$summary = foreach ($r in $results) {
+    $auditText = 'OK'
+    if (-not $r.AuditOk) { $auditText = 'CHECK' }
+    [pscustomobject]@{
+        Host              = $r.Host
+        User              = $r.User
+        TotalCrons        = $r.Crons
+        ActiveInWindow    = $r.Active
+        CommentedInWindow = $r.Commented
+        Audit             = $auditText
+    }
+}
+$table = $summary | Format-Table -AutoSize | Out-String -Width 4096
+foreach ($l in ($table.Trim("`r", "`n") -split "`r?`n")) { $out.Add($l.TrimEnd()) }
+$out.Add('')
+foreach ($r in $results) { $out.AddRange($r.Out) }
+
 $text = $out -join [Environment]::NewLine
 Write-Output $text
 
@@ -332,10 +410,11 @@ if (-not $ScreenOnly) {
     $text | Out-File -LiteralPath $OutFile -Encoding utf8
     Write-Host ""
     Write-Host "Saved to: $OutFile" -ForegroundColor Green
-    if ($Csv -and $Audit) {
-        $csvFile = [IO.Path]::ChangeExtension($OutFile, '.audit.csv')
-        $rows | Export-Csv -LiteralPath $csvFile -NoTypeInformation -Encoding UTF8
-        Write-Host "Audit CSV: $csvFile" -ForegroundColor Green
+    if ($Csv) {
+        $csvFile = [IO.Path]::ChangeExtension($OutFile, '.csv')
+        $results | ForEach-Object { $_.Rows } |
+            Export-Csv -LiteralPath $csvFile -NoTypeInformation -Encoding UTF8
+        Write-Host "Excel CSV (all files): $csvFile" -ForegroundColor Green
     }
 }
 

@@ -1,23 +1,30 @@
 # Get-MaintenanceCrons.ps1
 
-Reads a crontab text file and lists every cron that will fire during a
-maintenance window, in run order, with its name/comment tag shown above it.
+Reads one or many crontab text files (one per server/user) and lists every
+cron that will fire during a maintenance window, in run order, with its
+name/comment tag shown above it.
 Commented-out crons are listed too, clearly marked as **COMMENTED - will NOT run**.
 
 Default window: **Sat 14-Nov-2026 00:30 -> 12:30** (end time included).
 
 ---
 
-## 1. Prepare the cron file
+## 1. Prepare the cron files
 
-On the Linux server, export the crontab to a text file:
+On each Linux server, export each user's crontab to a file named **`<hostname>-<username>.txt`**:
 
 ```bash
-crontab -l > crontab.txt              # current user
-crontab -l -u <user> > crontab.txt    # another user (needs sudo)
+crontab -l > $(hostname -s)-$(whoami).txt          # current user
+sudo crontab -l -u webid > $(hostname -s)-webid.txt # another user
 ```
 
-Copy `crontab.txt` to your Windows machine (WinSCP, scp, etc.).
+Example: `lbat017-webid.txt`, `lbat017-root.txt`, `lbat018-oracle.txt`.
+
+Copy all files into one folder on your Windows machine (WinSCP, scp, etc.), e.g. `.\crons\`.
+
+> **Host/User from file name:** the name is split on the **last** `-`, so
+> `lb-app-02-oracle.txt` -> host `lb-app-02`, user `oracle`. A file without a
+> `-` gets the whole name as host and an empty user.
 
 > **Timezone:** the script compares cron times exactly as written. If the server
 > runs in a different timezone (e.g. UTC) than the maintenance window (e.g. IST),
@@ -31,7 +38,14 @@ Copy `crontab.txt` to your Windows machine (WinSCP, scp, etc.).
 Open PowerShell in this folder:
 
 ```powershell
-# Normal report
+# All files in a folder + audit + combined Excel CSV (recommended)
+.\Get-MaintenanceCrons.ps1 -CronFile .\crons -Audit -Csv
+
+# Specific files / wildcard
+.\Get-MaintenanceCrons.ps1 -CronFile .\crons\lbat017-webid.txt, .\crons\lbat017-root.txt
+.\Get-MaintenanceCrons.ps1 -CronFile .\crons\lbat017-*.txt
+
+# Single file
 .\Get-MaintenanceCrons.ps1 -CronFile .\crontab.txt
 
 # Report + validation audit (recommended)
@@ -54,14 +68,14 @@ powershell -ExecutionPolicy Bypass -File .\Get-MaintenanceCrons.ps1 -CronFile .\
 
 | Parameter      | Required | Default              | Description                                   |
 |----------------|----------|----------------------|-----------------------------------------------|
-| `-CronFile`    | Yes      |                      | Path to the crontab text file                 |
+| `-CronFile`    | Yes      |                      | One or more files, folders (all `*.txt` inside) or wildcards |
 | `-Start`       | No       | `2026-11-14 00:30`   | Window start (inclusive)                      |
 | `-End`         | No       | `2026-11-14 12:30`   | Window end (inclusive)                        |
 | `-OutFile`     | No       | `maintenance_crons_<yyyyMMdd>.txt` in current folder | Where to save the report |
 | `-Audit`       | No       | off                  | Add validation checks and an all-crons table to the output |
 | `-NoClipboard` | No       | off                  | Don't copy the report to the clipboard        |
 | `-ScreenOnly`  | No       | off                  | Print only: no .txt, no .csv, no clipboard    |
-| `-Csv`         | No       | off                  | With `-Audit`, also export all crons to `.audit.csv` for Excel |
+| `-Csv`         | No       | off                  | Also export all crons of all files to one `.csv` for Excel, with **Host** and **User** columns |
 
 ---
 
@@ -91,7 +105,17 @@ CRONS IN WINDOW    : 4 active, 1 commented (will not run)
    Runs: 03:00  (1 run(s))
 ```
 
-Sections in the report:
+The report starts with a summary per server/user:
+
+```
+Host      User   TotalCrons ActiveInWindow CommentedInWindow Audit
+----      ----   ---------- -------------- ----------------- -----
+lbat017   root            5              3                 2 OK
+lbat017   webid          10              4                 1 CHECK
+```
+
+`Audit = CHECK` means that file has lines needing a manual look (run with `-Audit` to see them).
+Then one section per file, headed `HOST: lbat017    USER: webid`, containing:
 
 1. **Crons in window**: active and commented, sorted by first run time.
 2. **Other commented crons**: commented crons outside the window, for reference.
@@ -159,8 +183,8 @@ LineNo Status    InWindow FirstRun RunCount Name                   Cron
    ```bash
    crontab -l | grep -cE '^\s*[0-9*@]'
    ```
-   The number must equal **Active crons parsed**.
-5. **Spot-check the ALL CRONS table** (in the .txt, or in Excel with `-Csv`):
+   The number must equal **Active crons parsed** for that host/user.
+5. **Spot-check the ALL CRONS table** (in the .txt, or in Excel with `-Csv`; filter by Host/User):
    - Filter `InWindow = NO` and look at crons near the window edges (hour `0`, `12`).
    - Filter `InWindow = YES` and verify 5-10 by hand (or paste into https://crontab.guru).
 
@@ -174,4 +198,4 @@ If all five pass, the report can be trusted.
 |-----------------------------------------|--------------------------------------|
 | `Get-MaintenanceCrons.ps1`              | The script                           |
 | `maintenance_crons_<date>.txt`          | Everything shown on screen (copy-paste ready) |
-| `maintenance_crons_<date>.audit.csv`    | All crons for Excel (`-Audit -Csv` only) |
+| `maintenance_crons_<date>.csv`          | All crons of all files for Excel, columns `Host, User, LineNo, Status, InWindow, FirstRun, RunCount, Runs, Name, Cron, File` (`-Csv` only) |
