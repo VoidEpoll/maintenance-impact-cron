@@ -37,6 +37,9 @@ Open PowerShell in this folder:
 # Report + validation audit (recommended)
 .\Get-MaintenanceCrons.ps1 -CronFile .\crontab.txt -Audit
 
+# Audit on screen only - no .txt, no .csv, no clipboard
+.\Get-MaintenanceCrons.ps1 -CronFile .\crontab.txt -Audit -ScreenOnly
+
 # Custom window
 .\Get-MaintenanceCrons.ps1 -CronFile .\crontab.txt -Start "2026-11-14 00:30" -End "2026-11-14 12:30"
 ```
@@ -55,14 +58,17 @@ powershell -ExecutionPolicy Bypass -File .\Get-MaintenanceCrons.ps1 -CronFile .\
 | `-Start`       | No       | `2026-11-14 00:30`   | Window start (inclusive)                      |
 | `-End`         | No       | `2026-11-14 12:30`   | Window end (inclusive)                        |
 | `-OutFile`     | No       | `maintenance_crons_<yyyyMMdd>.txt` in current folder | Where to save the report |
-| `-Audit`       | No       | off                  | Print validation checks and export a CSV      |
+| `-Audit`       | No       | off                  | Add validation checks and an all-crons table to the output |
 | `-NoClipboard` | No       | off                  | Don't copy the report to the clipboard        |
+| `-ScreenOnly`  | No       | off                  | Print only: no .txt, no .csv, no clipboard    |
+| `-Csv`         | No       | off                  | With `-Audit`, also export all crons to `.audit.csv` for Excel |
 
 ---
 
 ## 3. Output
 
-The report is **printed**, **saved to a .txt file** and **copied to the clipboard**,
+Everything (report and, with `-Audit`, the audit and all-crons table) is **printed**,
+**saved to one .txt file** (identical to the screen) and **copied to the clipboard**,
 ready to paste into email, Teams or a change ticket.
 
 ```
@@ -133,7 +139,14 @@ Line reconciliation        : OK (every line classified)
 Raw lines that look active : 198
 Active crons parsed        : 198
 Active cron cross-check    : OK
-Audit CSV (all 220 crons): ...\maintenance_crons_20261114.audit.csv
+
+Lines NOT understood       : none
+
+ALL 220 CRONS:
+LineNo Status    InWindow FirstRun RunCount Name                   Cron
+------ ------    -------- -------- -------- ----                   ----
+     6 ACTIVE    YES      02:30           1 ###### Daily DB backup 30 2 * * * /opt/scripts/db_backup.sh
+   ...
 ```
 
 ### Checklist
@@ -147,7 +160,7 @@ Audit CSV (all 220 crons): ...\maintenance_crons_20261114.audit.csv
    crontab -l | grep -cE '^\s*[0-9*@]'
    ```
    The number must equal **Active crons parsed**.
-5. **Spot-check the CSV** in Excel (`LineNo, Status, InWindow, FirstRun, RunCount, Runs, Name, Cron`):
+5. **Spot-check the ALL CRONS table** (in the .txt, or in Excel with `-Csv`):
    - Filter `InWindow = NO` and look at crons near the window edges (hour `0`, `12`).
    - Filter `InWindow = YES` and verify 5-10 by hand (or paste into https://crontab.guru).
 
@@ -160,5 +173,5 @@ If all five pass, the report can be trusted.
 | File                                    | Purpose                              |
 |-----------------------------------------|--------------------------------------|
 | `Get-MaintenanceCrons.ps1`              | The script                           |
-| `maintenance_crons_<date>.txt`          | Report (copy-paste ready)            |
-| `maintenance_crons_<date>.audit.csv`    | All crons with results (`-Audit` only) |
+| `maintenance_crons_<date>.txt`          | Everything shown on screen (copy-paste ready) |
+| `maintenance_crons_<date>.audit.csv`    | All crons for Excel (`-Audit -Csv` only) |

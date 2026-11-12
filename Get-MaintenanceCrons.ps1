@@ -24,7 +24,9 @@ param(
     [datetime]$End   = '2026-11-14 12:30',
     [string]$OutFile,
     [switch]$NoClipboard,
-    [switch]$Audit
+    [switch]$Audit,
+    [switch]$ScreenOnly,  # print only: no .txt, no .csv, no clipboard
+    [switch]$Csv          # with -Audit, also export all crons to .audit.csv
 )
 
 $ErrorActionPreference = 'Stop'
@@ -253,53 +255,43 @@ if ($reboot.Count -gt 0) {
     }
 }
 
-$text = $out -join [Environment]::NewLine
-Write-Output $text
-
-if (-not $OutFile) { $OutFile = Join-Path (Get-Location) ("maintenance_crons_{0}.txt" -f $Start.ToString('yyyyMMdd')) }
-$text | Out-File -LiteralPath $OutFile -Encoding utf8
-Write-Host ""
-Write-Host "Saved to: $OutFile" -ForegroundColor Green
-
-if (-not $NoClipboard) {
-    try { $text | Set-Clipboard; Write-Host 'Copied to clipboard.' -ForegroundColor Green } catch { }
-}
-
 # ---------------------------------------------------------------- audit
 if ($Audit) {
     $total   = $lines.Count
     $byType  = $lineTypes.Values | Group-Object | Sort-Object Name
     $sum     = ($byType | Measure-Object Count -Sum).Sum
     # Independent rough count: any non-comment line starting like a cron schedule
-    $rawActive = @($lines | Where-Object { $_ -match '^\s*[\d\*@]' }).Count
-
-    Write-Host ""
-    Write-Host "==================== AUDIT ====================" -ForegroundColor Cyan
-    Write-Host ("Total lines in file        : {0}" -f $total)
-    foreach ($g in $byType) { Write-Host ("  {0,-24} : {1}" -f $g.Name, $g.Count) }
-    if ($sum -eq $total) {
-        Write-Host "Line reconciliation        : OK (every line classified)" -ForegroundColor Green
-    } else {
-        Write-Host "Line reconciliation        : MISMATCH ($sum classified vs $total lines)" -ForegroundColor Red
-    }
+    $rawActive    = @($lines | Where-Object { $_ -match '^\s*[\d\*@]' }).Count
     $activeParsed = @($entries | Where-Object { -not $_.Commented }).Count
-    Write-Host ("Raw lines that look active : {0}" -f $rawActive)
-    Write-Host ("Active crons parsed        : {0}" -f $activeParsed)
-    if ($rawActive -eq $activeParsed) {
-        Write-Host "Active cron cross-check    : OK" -ForegroundColor Green
+
+    $out.Add('')
+    $out.Add('==================== AUDIT ====================')
+    $out.Add(("Total lines in file        : {0}" -f $total))
+    foreach ($g in $byType) { $out.Add(("  {0,-24} : {1}" -f $g.Name, $g.Count)) }
+    if ($sum -eq $total) {
+        $out.Add('Line reconciliation        : OK (every line classified)')
     } else {
-        Write-Host "Active cron cross-check    : MISMATCH - check UNPARSED lines below" -ForegroundColor Red
+        $out.Add("Line reconciliation        : MISMATCH ($sum classified vs $total lines)")
+    }
+    $out.Add(("Raw lines that look active : {0}" -f $rawActive))
+    $out.Add(("Active crons parsed        : {0}" -f $activeParsed))
+    if ($rawActive -eq $activeParsed) {
+        $out.Add('Active cron cross-check    : OK')
+    } else {
+        $out.Add('Active cron cross-check    : MISMATCH - check UNPARSED lines below')
     }
 
     $bad = @($lineTypes.GetEnumerator() | Where-Object { $_.Value -like 'UNPARSED*' } | Sort-Object Name)
+    $out.Add('')
     if ($bad.Count -gt 0) {
-        Write-Host ""
-        Write-Host "Lines NOT understood (check manually):" -ForegroundColor Yellow
-        foreach ($b in $bad) { Write-Host ("  line {0,4} [{1}] {2}" -f $b.Name, $b.Value, $lines[$b.Name - 1].Trim()) }
+        $out.Add('Lines NOT understood (check manually):')
+        foreach ($b in $bad) { $out.Add(("  line {0,4} [{1}] {2}" -f $b.Name, $b.Value, $lines[$b.Name - 1].Trim())) }
+    } else {
+        $out.Add('Lines NOT understood       : none')
     }
 
-    # Every cron with its result, for filtering/spot-checking in Excel
-    $csv = foreach ($e in $entries) {
+    # Every cron with its result, for spot-checking
+    $rows = foreach ($e in $entries) {
         $runs = $null
         if (-not $e.Reboot) { $runs = Get-CronRunTimes $e $Start $End }
         $count = 0
@@ -324,8 +316,29 @@ if ($Audit) {
             Cron     = $e.Raw
         }
     }
-    $csvFile = [IO.Path]::ChangeExtension($OutFile, '.audit.csv')
-    $csv | Export-Csv -LiteralPath $csvFile -NoTypeInformation -Encoding UTF8
+    $out.Add('')
+    $out.Add("ALL $($entries.Count) CRONS:")
+    # Wide fixed width so long commands are not cut off in the file
+    $table = $rows | Format-Table LineNo, Status, InWindow, FirstRun, RunCount, Name, Cron -AutoSize | Out-String -Width 4096
+    foreach ($l in ($table.Trim("`r", "`n") -split "`r?`n")) { $out.Add($l.TrimEnd()) }
+}
+
+# ---------------------------------------------------------------- print + save
+$text = $out -join [Environment]::NewLine
+Write-Output $text
+
+if (-not $OutFile) { $OutFile = Join-Path (Get-Location) ("maintenance_crons_{0}.txt" -f $Start.ToString('yyyyMMdd')) }
+if (-not $ScreenOnly) {
+    $text | Out-File -LiteralPath $OutFile -Encoding utf8
     Write-Host ""
-    Write-Host "Audit CSV (all $($entries.Count) crons): $csvFile" -ForegroundColor Green
+    Write-Host "Saved to: $OutFile" -ForegroundColor Green
+    if ($Csv -and $Audit) {
+        $csvFile = [IO.Path]::ChangeExtension($OutFile, '.audit.csv')
+        $rows | Export-Csv -LiteralPath $csvFile -NoTypeInformation -Encoding UTF8
+        Write-Host "Audit CSV: $csvFile" -ForegroundColor Green
+    }
+}
+
+if (-not $NoClipboard -and -not $ScreenOnly) {
+    try { $text | Set-Clipboard; Write-Host 'Copied to clipboard.' -ForegroundColor Green } catch { }
 }
